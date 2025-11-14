@@ -1,33 +1,44 @@
 #include <Wire.h>
 
 // ==========================================================
-// --- CẤU HÌNH CHUNG GPIO I2C ---
+// --- CẤU HÌNH CHUNG ---
 // ==========================================================
 #define SDA_PIN 6
 #define SCL_PIN 7
+
+// Biến cho hoạt động non-blocking (I2C)
+unsigned long lastI2CReadTime = 0;
+// Đặt lại khoảng thời gian đọc I2C là 5000ms (5 giây)
+const unsigned long i2cReadInterval = 5000; 
+
+// ==========================================================
+// --- CẤU HÌNH BUTTON VÀ LED ---
+// ==========================================================
+const int buttonPin = 4;  // SMD button connected to GPIO4
+const int ledPin = 8;     // Onboard LED on ESP32-C3 Super Mini connected to GPIO8 (active LOW)
+
+// Variables for button/LED
+int buttonState = 0;      // Current state of the button
+int lastButtonState = HIGH; // Previous state of the button (pull-up, so HIGH is default)
+bool ledState = true;     // Current state of the LED (true = on, ĐẢO NGƯỢC ĐỂ SÁNG MẶC ĐỊNH)
+unsigned long lastDebounceTime = 0;  // Last time the button was toggled
+const unsigned long debounceDelay = 50; // Debounce delay in milliseconds
 
 // ==========================================================
 // --- CẤU HÌNH SW3517S ---
 // ==========================================================
 #define SW3517S_ADDR 0x3C
-
 #define REG_IC_VER      0x01
 #define REG_FCX_STAT    0x06
 #define REG_PWR_STAT    0x07
-
-// Thanh ghi ADC (Buffered read)
 #define REG_ADC_TYPE    0x3A
 #define REG_ADC_H       0x3B
 #define REG_ADC_L       0x3C
-
-// --- Kênh ADC (cho REG_ADC_TYPE)  ---
 #define CHAN_VIN        1
 #define CHAN_VOUT       2
 #define CHAN_IOUT_C     3
 #define CHAN_IOUT_A     4
 #define CHAN_TEMP       6
-
-// --- Giá trị LSB (Step) ---
 #define VIN_STEP_MV     10.0f
 #define VOUT_STEP_MV    6.0f 
 #define IOUT_STEP_MA    2.5f 
@@ -41,19 +52,11 @@ bool sw3517sDetected = false;
 
 // Cấu trúc batteryData
 struct BatteryData {
-  float voltage;          // V
-  float current;          // A
-  float temperature;      // °C
-  uint16_t remainingCapacity;  // mAh
-  uint16_t fullCapacity;       // mAh
-  uint16_t batteryStatus;      // bit flags
-  uint16_t cycleCount;
-  uint16_t relativeSOC;    // %
-  uint16_t absoluteSOC;    // %
-  float vcell1;           // V (cell thấp nhất)
-  float vcell2;
-  float vcell3;
-  float vcell4;           // V (cell cao nhất)
+  float voltage; float current; float temperature;
+  uint16_t remainingCapacity; uint16_t fullCapacity; 
+  uint16_t batteryStatus; uint16_t cycleCount;
+  uint16_t relativeSOC; uint16_t absoluteSOC;
+  float vcell1; float vcell2; float vcell3; float vcell4;
 } batteryData;
 
 // Địa chỉ lệnh (chuẩn SBS)
@@ -102,12 +105,10 @@ uint16_t readSW_ADC(uint8_t channel) {
   Wire.beginTransmission(SW3517S_ADDR);
   Wire.write(REG_ADC_H);
   if (Wire.endTransmission(false) != 0) {
-    Serial.println("Error: Not found SW3517S ADC pointer");
     return 0;
   }
 
   if (Wire.requestFrom(SW3517S_ADDR, 2) != 2) {
-    Serial.println("Error: Not found SW3517S ADC data");
     return 0;
   }
 
@@ -173,7 +174,7 @@ void readAndPrintSWData() {
   float iout_a = iout_a_raw * IOUT_STEP_MA / 1000.0f;
   
   // 4. In kết quả
-  // Serial.printf("VIN : %.2f V  (raw: %u)\n", vin, vin_raw);
+  Serial.printf("VIN : %.2f V  (raw: %u)\n", vin, vin_raw);
   Serial.printf("VOUT: %.2f V  (raw: %u)\n", vout, vout_raw);
   Serial.println("--- Output 2---");
   Serial.printf("  Port-C: %.2f A  (raw: %u)\n", iout_c, iout_c_raw);
@@ -186,7 +187,7 @@ void readAndPrintSWData() {
 // --- CÁC HÀM CỦA BMS ---
 // ==========================================================
 
-// Hàm đọc SMBus
+// Hàm đọc SMBus (2 bytes)
 uint16_t readRegister_BMS(uint8_t cmd) {
   for (int retry = 0; retry < MAX_RETRIES; retry++) {
     Wire.beginTransmission(BMS_ADDR);
@@ -196,18 +197,14 @@ uint16_t readRegister_BMS(uint8_t cmd) {
         uint16_t low = Wire.read();
         uint16_t high = Wire.read();
         return (high << 8) | low;
-      } else {
-        Serial.printf("Retry %d: No data for cmd 0x%02X\n", retry + 1, cmd);
       }
-    } else {
-      Serial.printf("Retry %d: No ACK for cmd 0x%02X\n", retry + 1, cmd);
     }
     delay(10);
   }
-  Serial.printf("Error: Failed read cmd 0x%02X after %d retries\n", cmd, MAX_RETRIES);
-  return 0xFFFF;
+  return 0xFFFF; // Trả về giá trị lỗi
 }
 
+// Hàm đọc SMBus (Signed)
 int16_t readSignedRegister_BMS(uint8_t cmd) {
   return (int16_t)readRegister_BMS(cmd);
 }
@@ -247,9 +244,8 @@ void scanI2C() {
   int nDevices = 0;
   Serial.println("Scanning I2C bus...");
 
-  // Reset cờ phát hiện
   bmsDetected = false;
-  // (Chúng ta sẽ kiểm tra sw3517s riêng)
+  sw3517sDetected = false;
 
   for (address = 1; address < 127; address++) {
     Wire.beginTransmission(address);
@@ -264,7 +260,7 @@ void scanI2C() {
       }
       if (address == SW3517S_ADDR) {
         Serial.println(">>> SW3517S detected at 0x3C! <<<");
-        // cờ sw3517sDetected sẽ được đặt trong setup()
+        sw3517sDetected = true;
       }
     } else if (error == 4) {
       Serial.printf("Unknown error at 0x%02X\n", address);
@@ -292,77 +288,23 @@ void readBatteryData() {
   raw = readRegister_BMS(CMD_TEMPERATURE);
   batteryData.temperature = (raw != 0xFFFF) ? raw / 10.0f - 273.15f : 0.0f;
 
-  raw = readRegister_BMS(CMD_REMAINING_CAPACITY);
-  batteryData.remainingCapacity = (raw != 0xFFFF) ? raw : 0;
+  batteryData.remainingCapacity = readRegister_BMS(CMD_REMAINING_CAPACITY);
+  batteryData.fullCapacity = readRegister_BMS(CMD_FULL_CAPACITY);
+  batteryData.batteryStatus = readRegister_BMS(CMD_BATTERY_STATUS);
+  batteryData.cycleCount = readRegister_BMS(CMD_CYCLE_COUNT);
+  batteryData.relativeSOC = readRegister_BMS(CMD_RELATIVE_SOC);
+  batteryData.absoluteSOC = readRegister_BMS(CMD_ABSOLUTE_SOC);
 
-  raw = readRegister_BMS(CMD_FULL_CAPACITY);
-  batteryData.fullCapacity = (raw != 0xFFFF) ? raw : 0;
-
-  raw = readRegister_BMS(CMD_BATTERY_STATUS);
-  batteryData.batteryStatus = (raw != 0xFFFF) ? raw : 0;
-
-  raw = readRegister_BMS(CMD_CYCLE_COUNT);
-  batteryData.cycleCount = (raw != 0xFFFF) ? raw : 0;
-
-  raw = readRegister_BMS(CMD_RELATIVE_SOC);
-  batteryData.relativeSOC = (raw != 0xFFFF) ? raw : 0;
-
-  raw = readRegister_BMS(CMD_ABSOLUTE_SOC);
-  batteryData.absoluteSOC = (raw != 0xFFFF) ? raw : 0;
-
-  raw = readRegister_BMS(CMD_VCELL1);
-  batteryData.vcell1 = (raw != 0xFFFF) ? raw / 1000.0f : 0.0f;
-
-  raw = readRegister_BMS(CMD_VCELL2);
-  batteryData.vcell2 = (raw != 0xFFFF) ? raw / 1000.0f : 0.0f;
-
-  raw = readRegister_BMS(CMD_VCELL3);
-  batteryData.vcell3 = (raw != 0xFFFF) ? raw / 1000.0f : 0.0f;
-
-  raw = readRegister_BMS(CMD_VCELL4);
-  batteryData.vcell4 = (raw != 0xFFFF) ? raw / 1000.0f : 0.0f;
+  // Cell Voltages
+  batteryData.vcell1 = (readRegister_BMS(CMD_VCELL1) != 0xFFFF) ? readRegister_BMS(CMD_VCELL1) / 1000.0f : 0.0f;
+  batteryData.vcell2 = (readRegister_BMS(CMD_VCELL2) != 0xFFFF) ? readRegister_BMS(CMD_VCELL2) / 1000.0f : 0.0f;
+  batteryData.vcell3 = (readRegister_BMS(CMD_VCELL3) != 0xFFFF) ? readRegister_BMS(CMD_VCELL3) / 1000.0f : 0.0f;
+  batteryData.vcell4 = (readRegister_BMS(CMD_VCELL4) != 0xFFFF) ? readRegister_BMS(CMD_VCELL4) / 1000.0f : 0.0f;
 }
 
-// ==========================================================
-// --- HÀM SETUP VÀ LOOP CHÍNH ---
-// ==========================================================
-
-void setup() {
-  Serial.begin(115200);
-  while (!Serial); delay(100);
-
-  Wire.begin(SDA_PIN, SCL_PIN);
-  Wire.setClock(100000);
-  delay(1000); // Chờ khởi tạo
-
-  Serial.println(F("\n=== SW3517S & BMS Monitor ==="));
-  
-  // Chạy I2C scanner để phát hiện BMS (và các thiết bị khác)
-  scanI2C();
-
-  // Kiểm tra cụ thể SW3517S
-  Serial.println(F("--- SW3517S (0x3C) ---"));
-  uint8_t ic_ver = readReg_SW(REG_IC_VER);
-  if (ic_ver == 0xFF) {
-    Serial.println("Error: Not found SW3517S 0x3C");
-    sw3517sDetected = false;
-  } else {
-    ic_ver &= 0x07; //
-    Serial.print("Found SW3517S IC, version: "); Serial.println(ic_ver);
-    sw3517sDetected = true;
-  }
-  
-  Serial.println(F("========================================="));
-  delay(500);
-}
-
-void loop() {
-  
-  // --- 1. XỬ LÝ BMS ---
-  if (bmsDetected) {
+// Hàm in dữ liệu BMS
+void printBMSData() {
     Serial.println(F("\n--- BMS (0x0B) ---"));
-    readBatteryData();
-    
     if (batteryData.voltage != 0.0f || batteryData.current != 0.0f) {
       Serial.printf("Voltage: %.2f V\n", batteryData.voltage);
       Serial.printf("Current: %.2f A\n", batteryData.current);
@@ -377,25 +319,106 @@ void loop() {
     } else {
       Serial.println("Error: BMS read returned 0/error.");
     }
+}
+
+// ==========================================================
+// --- HÀM SETUP VÀ LOOP CHÍNH ---
+// ==========================================================
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial); delay(100);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+
+  // Cấu hình button và LED
+  pinMode(buttonPin, INPUT_PULLUP); // Button with internal pull-up resistor
+  pinMode(ledPin, OUTPUT);          // LED as output
+  digitalWrite(ledPin, ledState ? LOW : HIGH); // Set initial LED state (LOW = on, active LOW)
+  
+  delay(1000); // Chờ khởi tạo
+
+  Serial.println(F("\n=== SW3517S & BMS Monitor ==="));
+  
+  // 1. CHỈ CHẠY SCAN I2C MỘT LẦN TRONG SETUP
+  scanI2C();
+
+  // 2. Kiểm tra xác nhận SW3517S
+  Serial.println(F("--- SW3517S (0x3C) ---"));
+  if (sw3517sDetected) {
+      uint8_t ic_ver = readReg_SW(REG_IC_VER);
+      if (ic_ver == 0xFF) {
+        Serial.println("Error: Failed to confirm SW3517S at 0x3C.");
+        sw3517sDetected = false;
+      } else {
+        ic_ver &= 0x07;
+        Serial.print("Found SW3517S IC, version: "); Serial.println(ic_ver);
+      }
   } else {
-    Serial.println(F("\n--- Not found BMS. Trying to scan again... ---"));
-    scanI2C(); // Sẽ cố gắng đặt bmsDetected = true nếu tìm thấy
+      Serial.println("SW3517S not found during initial scan.");
+  }
+  
+  // 3. Đọc dữ liệu ban đầu cho BMS/SW3517S
+  if (bmsDetected) readBatteryData();
+  if (sw3517sDetected) readAndPrintSWData();
+  
+  lastI2CReadTime = millis(); // Thiết lập thời gian đọc I2C ban đầu
+  
+  Serial.println(F("========================================="));
+}
+
+void loop() {
+  // --- 1. XỬ LÝ BUTTON VÀ LED (NON-BLOCKING) ---
+  int reading = digitalRead(buttonPin);
+
+  // Check if the button state has changed
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis(); // Reset the debounce timer
   }
 
-  // --- 2. XỬ LÝ SW3517S ---
-  if (sw3517sDetected) {
-    Serial.println(F("\n--- SW3517S (0x3C) ---"));
-    readAndPrintSWData(); // Gọi hàm đã tách ra
-  } else {
-    Serial.println(F("\n--- Not found SW3517S. Trying to scan again... ---"));
-    uint8_t ic_ver = readReg_SW(REG_IC_VER);
-    if (ic_ver != 0xFF) {
-      sw3517sDetected = true;
-      Serial.println("Found SW3517S");
+  // If the debounce period has passed, process the button state
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    if (reading != buttonState) {
+      buttonState = reading;
+
+      // If the button is pressed (LOW due to pull-up)
+      if (buttonState == LOW) {
+        ledState = !ledState; // Toggle LED state
+        digitalWrite(ledPin, ledState ? LOW : HIGH); // Update LED (LOW = on, HIGH = off)
+        Serial.println(ledState ? "LED ON" : "LED OFF");
+      }
     }
   }
 
-  Serial.println(F("========================================="));
-  Serial.println(F("Delay 5s..."));
-  delay(5000); // Sử dụng delay của BMS
+  lastButtonState = reading; // Save the current button state for the next loop
+
+  // --- 2. XỬ LÝ I2C (CHẠY ĐỊNH KỲ 5S, NON-BLOCKING) ---
+  unsigned long currentMillis = millis();
+  
+  // KHÔNG DÙNG DELAY. Chỉ chạy khi đã đủ 5 giây
+  if (currentMillis - lastI2CReadTime >= i2cReadInterval) {
+    lastI2CReadTime = currentMillis; // Reset timer
+
+    Serial.println(F("\n========================================="));
+    Serial.println(F("Reading I2C data (Interval 5s)..."));
+
+    // --- 2a. XỬ LÝ BMS ---
+    if (bmsDetected) {
+      readBatteryData();
+      printBMSData();
+    } else {
+      Serial.println(F("\n--- BMS (0x0B) Not Found. Scan only runs in setup(). ---"));
+    }
+
+    // --- 2b. XỬ LÝ SW3517S ---
+    if (sw3517sDetected) {
+      Serial.println(F("\n--- SW3517S (0x3C) ---"));
+      readAndPrintSWData();
+    } else {
+      Serial.println(F("\n--- SW3517S (0x3C) Not Found. Scan only runs in setup(). ---"));
+    }
+    
+    Serial.println(F("========================================="));
+  }
 }
